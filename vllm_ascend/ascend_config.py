@@ -443,6 +443,7 @@ class AscendConfig:
             "msmonitor_use_daemon": false,
             "enable_transpose_kv_cache_by_block": true,
             "weight_nz_mode": 1,
+            "enable_pad_mask_writeback": false,
             "enable_shared_expert_dp": false,
             "enable_sparse_sfa_c8": false,
             "enable_sparse_li_c8": false,
@@ -613,6 +614,11 @@ class AscendConfig:
     msmonitor_use_daemon: bool = False
     enable_transpose_kv_cache_by_block: bool = True
     weight_nz_mode: int = 1
+    # Replace the per-layer arange/less/logical_not/masked_fill padding mask
+    # (KDA recurrent output) and its DSA NoPE attention twin with the existing
+    # single-launch recurrent writeback. Only steady-state spec-verify steps
+    # take the shortcut; mixed batches keep the original path byte for byte.
+    enable_pad_mask_writeback: bool = False
 
     # ---- sub-configs (no vllm_config dep): pydantic dict→dataclass coercion ----
     ascend_compilation_config: AscendCompilationConfig = dataclasses.field(default_factory=AscendCompilationConfig)

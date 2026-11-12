@@ -24,6 +24,7 @@ from vllm.model_executor.model_loader.weight_utils import sharded_weight_loader
 from vllm.model_executor.utils import set_weight_attrs
 from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadata
 
+from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.attention.utils import (
     maybe_save_kv_layer_to_connector,
     wait_for_kv_layer_from_connector,
@@ -164,6 +165,7 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
 
         projection_size = self.head_dim * self.num_heads
         self.local_projection_size = divide(projection_size, self.tp_size)
+        self.pad_mask_writeback = get_ascend_config().enable_pad_mask_writeback
 
         # Merge q, k, v, b, f_a, g_a projections into one GEMM (6→1 launches).
         # Order matches checkpoint's fused_qkvbfg_a_proj convention.
@@ -438,6 +440,7 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
         # num_accepted_tokens for rejection-sampling rollback; non-spec tokens
         # are one-per-request. Mirrors olmo_gdn_linear_attn.py. Projections are
         # [n, *] (token dim 0); g1/beta are [1, n, h, d] (token dim 1).
+        uniform_spec = False
         if use_spec:
             # In a pure spec-verify step (no non-spec tokens) the metadata
             # builder sets spec_token_indx = arange(num_actual_tokens), making
@@ -445,7 +448,8 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
             # steady-state decode hot path. The outputs alias the inputs here;
             # the downstream conv/recurrent kernels read them without mutating
             # in place, so the aliasing is safe.
-            if non_spec_token_indx is None or non_spec_token_indx.numel() == 0:
+            uniform_spec = non_spec_token_indx is None or non_spec_token_indx.numel() == 0
+            if uniform_spec:
                 qkv_spec = qkv_proj_states
                 g1_spec = g1
                 beta_spec = beta
@@ -453,7 +457,7 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
                 qkv_spec = qkv_proj_states.index_select(0, spec_token_indx)
                 g1_spec = g1.index_select(1, spec_token_indx)
                 beta_spec = beta.index_select(1, spec_token_indx)
-            if non_spec_token_indx is not None and non_spec_token_indx.numel() > 0:
+            if not uniform_spec:
                 qkv_ns = qkv_proj_states.index_select(0, non_spec_token_indx)
                 g1_ns = g1.index_select(1, non_spec_token_indx)
                 beta_ns = beta.index_select(1, non_spec_token_indx)
@@ -514,7 +518,14 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
         direct_output = (
             not use_spec and attn_metadata_narrowed.num_prefills == 0 and attn_metadata_narrowed.num_decodes > 0
         )
-        if not direct_output:
+        # Steady-state spec-verify: spec_token_indx is arange(num_actual_tokens)
+        # and non_spec_token_indx is empty, so the index_copy below is an
+        # identity copy and the arange/less/logical_not/masked_fill chain inside
+        # recurrent_kda only exists to zero graph-capacity padding rows. Let the
+        # recurrent writeback fill the buffer in one launch instead: same bytes,
+        # padding zeroed in place.
+        spec_writeback = self.pad_mask_writeback and uniform_spec
+        if not direct_output and not spec_writeback:
             core_attn_out.zero_()
         if use_spec:
             spec_output = recurrent_kda(
@@ -530,8 +541,10 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
                 self.dt_bias,
                 lower_bound,
                 num_accepted_tokens,
+                output_buffer=core_attn_out if spec_writeback else None,
             )
-            core_attn_out[0].index_copy_(0, spec_token_indx, spec_output[0])
+            if not spec_writeback:
+                core_attn_out[0].index_copy_(0, spec_token_indx, spec_output[0])
 
         if q_ns is None:
             maybe_save_kv_layer_to_connector("", [])
