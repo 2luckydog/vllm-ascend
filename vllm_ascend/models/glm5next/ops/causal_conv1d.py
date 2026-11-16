@@ -2,11 +2,29 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """AscendC short convolution for GLM prefill, decode and MTP verification."""
 
+import functools
+
 import torch
 from fla_npu.ops.ascendc import causal_conv1d_fn, causal_conv1d_update
 from vllm.v1.attention.backends.utils import PAD_SLOT_ID
 
 from vllm_ascend.ops.triton.kda.conv_state import copy_conv_state
+
+
+@functools.lru_cache(maxsize=1)
+def _inplace_conv_state_enabled() -> bool:
+    from vllm_ascend.ascend_config import get_ascend_config
+
+    return bool(get_ascend_config().enable_kda_conv_state_inplace)
+
+
+def _stride_writable(conv_state: torch.Tensor) -> bool:
+    """Whether aclnn can mutate this state view in place.
+
+    Dimension-first (DS) layouts are rejected by aclnn (561002) and negative
+    strides cannot be addressed, so both keep the staging path.
+    """
+    return conv_state.stride(2) == 1 and conv_state.stride(0) > 0 and conv_state.stride(1) > 0
 
 
 def causal_conv1d(
@@ -21,8 +39,15 @@ def causal_conv1d(
     num_accepted_tokens: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Consume GDN metadata and update the caller's [cache, state_len, dim] state."""
-    # Padded requests can be skipped by the kernel; their output must stay zero.
-    output = torch.zeros_like(x)
+    # Padded requests are skipped by the kernel, so their output rows are only
+    # "clean" because they are pre-zeroed. Decode never reads them: every
+    # stateful write (conv_state, recurrent_state, KV cache) skips PAD_SLOT_ID
+    # and sampling indexes real requests only. The fast path therefore skips
+    # the 34 per-step zeroing launches; prefill keeps the zeroed buffer.
+    if run_mode == 1 and _inplace_conv_state_enabled():
+        output = torch.empty_like(x)
+    else:
+        output = torch.zeros_like(x)
     if cache_indices.shape[0] == 0:
         return output
     kernel_state = conv_state
@@ -31,7 +56,18 @@ def causal_conv1d(
     # aclnnCausalConv1d materializes a non-contiguous state without writing its
     # mutations back to the view. Stage only this batch's rows, retaining both
     # page strides and DS layouts; never copy the entire persistent cache.
-    if not conv_state.is_contiguous():
+    staged = not conv_state.is_contiguous()
+    # Decode-side UPDATE can mutate the strided cache in place, which removes
+    # the pack/writeback copies entirely. Prefill keeps staging: the in-place
+    # contract is only validated for UPDATE. Padding rows reach the kernel as
+    # NULL_BLOCK_ID, folded by the metadata builder once per step, because
+    # UPDATE reads out of bounds on negative indices.
+    if staged and run_mode == 1 and _inplace_conv_state_enabled() and _stride_writable(conv_state):
+        # null_block_id stays 0 = NULL_BLOCK_ID, the value padding rows carry.
+        staged = False
+        if cache_indices.dim() == 2:
+            kernel_indices = cache_indices[:, 0]
+    if staged:
         requests = cache_indices.shape[0]
         state_len, dim = conv_state.shape[1:]
         # UPDATE does not recognize PAD_SLOT_ID: a negative null_block_id
@@ -68,6 +104,6 @@ def causal_conv1d(
             null_block_id=null_block_id,
             out=output,
         )
-    if not conv_state.is_contiguous():
+    if staged:
         copy_conv_state(conv_state, kernel_state, cache_indices, query_start_loc, kernel_indices, write_back=True)
     return result

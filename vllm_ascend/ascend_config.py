@@ -443,6 +443,7 @@ class AscendConfig:
             "msmonitor_use_daemon": false,
             "enable_transpose_kv_cache_by_block": true,
             "weight_nz_mode": 1,
+            "enable_kda_conv_state_inplace": false,
             "enable_shared_expert_dp": false,
             "enable_sparse_sfa_c8": false,
             "enable_sparse_li_c8": false,
@@ -613,6 +614,17 @@ class AscendConfig:
     msmonitor_use_daemon: bool = False
     enable_transpose_kv_cache_by_block: bool = True
     weight_nz_mode: int = 1
+
+    # Feed the strided [cache, state_len, dim] conv_state view straight to
+    # AscendC causal_conv1d_update so it mutates the persistent cache in place,
+    # removing the per-layer pack/writeback copies (34 layers x 2 per step).
+    # Needs a one-off 1-D index normalisation per step, done by the GDN
+    # metadata builder. Dimension-first (DS) conv states keep the old staging
+    # path because aclnn rejects them (561002).
+    # The same switch also drops the two per-layer zeroing launches (conv output
+    # buffer and core_attn_out), since decode never reads graph-padding rows:
+    # state writes skip PAD_SLOT_ID and sampling indexes real requests only.
+    enable_kda_conv_state_inplace: bool = False
 
     # ---- sub-configs (no vllm_config dep): pydantic dict→dataclass coercion ----
     ascend_compilation_config: AscendCompilationConfig = dataclasses.field(default_factory=AscendCompilationConfig)

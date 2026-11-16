@@ -32,6 +32,7 @@ from vllm.v1.attention.backends.utils import (
 )
 from vllm.v1.kv_cache_interface import AttentionSpec
 
+from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.ops.triton.fla.utils import (
     prepare_chunk_indices,
     prepare_chunk_offsets,
@@ -392,6 +393,32 @@ class AscendGDNAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
                 (sequence_index_capacity + 1,), dtype=torch.int32, device=device
             )
 
+        # One request-row buffer shared by every KDA layer for the in-place
+        # conv_state path: 1-D, contiguous, and free of negative (padding) rows.
+        # Scoped to GLM-5.3: other GDN models keep the 2-D packed index layout.
+        self.conv_state_indices: torch.Tensor | None = None
+        model_type = str(getattr(self.vllm_config.model_config.hf_config, "model_type", ""))
+        if get_ascend_config().enable_kda_conv_state_inplace and model_type.startswith("glm5_next"):
+            self.conv_state_indices = torch.empty((sequence_index_capacity,), dtype=torch.int32, device=device)
+
+    def _conv_state_indices(self, indices: torch.Tensor) -> torch.Tensor:
+        """Normalise per-step conv_state indices once, for all KDA layers.
+
+        ``causal_conv1d_update`` cannot take ``PAD_SLOT_ID`` (-1): negative
+        indices read out of bounds and corrupt neighbouring requests, so graph
+        padding rows are folded onto ``NULL_BLOCK_ID``, the value the rest of
+        the graph-padding path already uses and the value compared against
+        ``null_block_id``. The 1-D form is also required because the packed
+        index tensor is ``[rows, num_spec + 1]``.
+        """
+        if self.conv_state_indices is None:
+            return indices
+        flat = indices[:, 0] if indices.dim() == 2 else indices
+        buffer = self.conv_state_indices[: flat.shape[0]]
+        buffer.copy_(flat, non_blocking=True)
+        buffer.masked_fill_(buffer < 0, NULL_BLOCK_ID)
+        return buffer
+
     def _init_reorder_batch_threshold(
         self,
         reorder_batch_threshold: int | None = 1,
@@ -508,7 +535,7 @@ class AscendGDNAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
         attn_metadata.spec_decode_metadata = GDNSpecDecodeMetadata(
             spec_causal_conv1d=GDNSpecCausalConv1dMetadata(
                 query_start_loc=attn_metadata.spec_query_start_loc,
-                cache_indices=attn_metadata.spec_state_indices_tensor[:spec_num_rows],
+                cache_indices=self._conv_state_indices(attn_metadata.spec_state_indices_tensor[:spec_num_rows]),
                 num_accepted_tokens=attn_metadata.num_accepted_tokens[:spec_num_rows],
             ),
             actual_seq_lengths=(

@@ -24,6 +24,7 @@ from vllm.model_executor.model_loader.weight_utils import sharded_weight_loader
 from vllm.model_executor.utils import set_weight_attrs
 from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadata
 
+from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.attention.utils import (
     maybe_save_kv_layer_to_connector,
     wait_for_kv_layer_from_connector,
@@ -164,6 +165,10 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
 
         projection_size = self.head_dim * self.num_heads
         self.local_projection_size = divide(projection_size, self.tp_size)
+        # Decode never observes graph-padding rows (state writes skip
+        # PAD_SLOT_ID, sampling indexes real requests), so the per-layer output
+        # buffer does not need to be pre-zeroed for them.
+        self.no_zero_fill = get_ascend_config().enable_kda_conv_state_inplace
 
         # Merge q, k, v, b, f_a, g_a projections into one GEMM (6→1 launches).
         # Order matches checkpoint's fused_qkvbfg_a_proj convention.
@@ -514,7 +519,7 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
         direct_output = (
             not use_spec and attn_metadata_narrowed.num_prefills == 0 and attn_metadata_narrowed.num_decodes > 0
         )
-        if not direct_output:
+        if not direct_output and not self.no_zero_fill:
             core_attn_out.zero_()
         if use_spec:
             spec_output = recurrent_kda(
