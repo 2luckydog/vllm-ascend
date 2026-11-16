@@ -29,6 +29,7 @@ from vllm.model_executor.layers.fused_moe.layer import MoERunner
 from vllm.model_executor.layers.fused_moe.runner.moe_runner import _moe_forward_shared, _unpack
 from vllm.utils.torch_utils import direct_register_custom_op
 
+from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX, MoECommType
 from vllm_ascend.distributed.parallel_state import get_mc2_group
 from vllm_ascend.ops.fused_moe.dataclass.shared_experts import PreparedSharedExpertInput, RoutedMoEMilestones
@@ -142,6 +143,16 @@ class AscendMoERunner(MoERunner):  # type: ignore[no-redef]
             and self._can_overlap_sp_shared_with(self.routed_output_transform)
         )
 
+        # Opt-in: use a plain tensor add for the shared+routed combine instead of
+        # a single-element `torch._foreach_add`. Both are bit-identical; the
+        # foreach form additionally costs a dedicated ForeachAddList launch per
+        # MoE layer (measured ~17us x 45 layers per decode step on 910B).
+        try:
+            self._plain_tail_add = get_ascend_config().enable_moe_tail_plain_add
+        except RuntimeError:
+            # Unit tests build the runner without initializing Ascend config.
+            self._plain_tail_add = False
+
         setup_moe_comm_method(self.moe_config)
         # Communication objects are shared across MoE layers. Keep the bound
         # activation with its owning layer when a later layer replaces them.
@@ -169,8 +180,9 @@ class AscendMoERunner(MoERunner):  # type: ignore[no-redef]
         through the OOT PluggableLayer dispatch of ``MoERunner``).
 
         Latent W4A8 SP shared experts use a plain tensor Add after the
-        routed-output transform. Other paths retain the foreach combine.
-        The runtime-aware reduction hooks (#16550) are unchanged.
+        routed-output transform. Other paths retain the foreach combine unless
+        ``additional_config.enable_moe_tail_plain_add`` is set. The
+        runtime-aware reduction hooks (#16550) are unchanged.
         """
         # Apply transform for routed experts (e.g., latent projection for
         # latent MoE). When the caller pre-applies the routed input transform
@@ -233,7 +245,7 @@ class AscendMoERunner(MoERunner):  # type: ignore[no-redef]
         fused_output = self.apply_routed_output_transform(fused_output)
 
         if shared_output is not None:
-            if getattr(self, "_release_shared_schedule", False):
+            if getattr(self, "_plain_tail_add", False) or getattr(self, "_release_shared_schedule", False):
                 result = shared_output + fused_output
             else:
                 result = torch._foreach_add([shared_output], [fused_output])[0]
