@@ -24,6 +24,7 @@ from vllm.model_executor.model_loader.weight_utils import sharded_weight_loader
 from vllm.model_executor.utils import set_weight_attrs
 from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadata
 
+from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.attention.utils import (
     maybe_save_kv_layer_to_connector,
     wait_for_kv_layer_from_connector,
@@ -165,6 +166,11 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
         projection_size = self.head_dim * self.num_heads
         self.local_projection_size = divide(projection_size, self.tp_size)
 
+        # Merge the two f_a/g_a low-rank projections into one batched GEMM.
+        # Lazily built: weights only become valid after load_weights().
+        self.fg_bmm_merge = get_ascend_config().enable_kda_fg_bmm_merge
+        self._fg_bmm_weight: torch.Tensor | None = None
+
         # Merge q, k, v, b, f_a, g_a projections into one GEMM (6→1 launches).
         # Order matches checkpoint's fused_qkvbfg_a_proj convention.
         # Shards 4 (f_a) and 5 (g_a) are replicated across TP ranks.
@@ -276,6 +282,35 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
     def get_attn_backend(self):
         return AscendGDNHostMetadataBackend
 
+    def _get_fg_bmm_weight(self) -> torch.Tensor | None:
+        """Stack the f_b_proj / g_b_proj weights into one
+        [2, head_dim, local_projection_size] tensor so both low-rank
+        projections run as a single batched GEMM.
+
+        Built lazily: the weights only become valid after ``load_weights``.
+        Returns None when the branch weights are not a plain 2-D bf16/fp16
+        matmul (e.g. quantized), in which case the caller keeps the original
+        two-linear path.
+        """
+        if self._fg_bmm_weight is not None:
+            return self._fg_bmm_weight
+        w_f = getattr(self.f_b_proj, "weight", None)
+        w_g = getattr(self.g_b_proj, "weight", None)
+        if w_f is None or w_g is None:
+            return None
+        if w_f.dtype not in (torch.bfloat16, torch.float16):
+            return None
+        if w_f.dim() != 2 or w_f.shape != w_g.shape:
+            return None
+        if w_f.shape[0] != self.local_projection_size or w_f.shape[1] != self.head_dim:
+            return None
+        self._fg_bmm_weight = (
+            torch.stack([w_f.detach(), w_g.detach()], dim=0)
+            .transpose(1, 2)
+            .contiguous()
+        )
+        return self._fg_bmm_weight
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -284,28 +319,62 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
         num_tokens = hidden_states.size(0)
         # One merged GEMM for q, k, v, b, f_a, g_a (replaces 6 separate GEMMs).
         projected = self.in_proj_qkvbfg_a(hidden_states)[0]
-        qkv, beta_raw, f_a, g_a = projected.split(
-            [
-                3 * self.local_projection_size,
-                self.local_num_heads,
-                self.head_dim,
-                self.head_dim,
-            ],
-            dim=-1,
-        )
 
-        # Beta stays raw (bf16) here: the recurrent kernel sigmoids it in fp32
-        # at load (SIGMOID_BETA), and only the chunked prefill path needs the
-        # pre-computed fp32 sigmoid — computed lazily in _forward. Pure decode
-        # / spec-verify steps then skip the separate sigmoid and its fp32
-        # intermediate entirely.
-        beta = beta_raw.unsqueeze(0)
-        g1 = self.f_b_proj(f_a)[0]
-        g1 = g1.reshape(1, -1, self.local_num_heads, self.head_dim)
+        if self.fg_bmm_merge:
+            # f_a and g_a are the last two head_dim-wide shards of the fused
+            # projection and therefore adjacent in memory: one slice + view
+            # feeds both branches, and one batched GEMM (batch=2) replaces
+            # the two separate [T,128]x[2048,128] matmuls.
+            qkv, beta_raw, fg = projected.split(
+                [
+                    3 * self.local_projection_size,
+                    self.local_num_heads,
+                    2 * self.head_dim,
+                ],
+                dim=-1,
+            )
+            fg_weight = self._get_fg_bmm_weight()
+            if fg_weight is not None:
+                # f_a/g_a are interleaved per row in the [T, 2*head_dim] view:
+                # splitting the width into (2, head_dim) and moving that axis to
+                # the front yields the [2, T, head_dim] batched layout with zero
+                # copies (pure stride juggling, no kernel). torch.stack instead
+                # materialises an aclnnStack Pack (~7.5us/layer) that costs more
+                # than the second matmul it removes.
+                fg_batched = fg.view(-1, 2, self.head_dim).transpose(0, 1)
+                fg_out = torch.bmm(fg_batched, fg_weight)
+                g1 = fg_out[0].reshape(1, -1, self.local_num_heads, self.head_dim)
+                g2 = fg_out[1].reshape(-1, self.local_num_heads, self.head_dim)
+            else:
+                # Quantized / non-plain weights: keep the two-linear path.
+                g1 = self.f_b_proj(fg[:, : self.head_dim])[0]
+                g1 = g1.reshape(1, -1, self.local_num_heads, self.head_dim)
+                g2 = self.g_b_proj(fg[:, self.head_dim :])[0]
+                g2 = g2.reshape(-1, self.local_num_heads, self.head_dim)
+            beta = beta_raw.unsqueeze(0)
+        else:
+            qkv, beta_raw, f_a, g_a = projected.split(
+                [
+                    3 * self.local_projection_size,
+                    self.local_num_heads,
+                    self.head_dim,
+                    self.head_dim,
+                ],
+                dim=-1,
+            )
 
-        g_proj_states = self.g_b_proj(g_a)[0]
-        # Must stay 3D: rms_norm_gated reads H from g.shape[-2].
-        g2 = g_proj_states.reshape(-1, self.local_num_heads, self.head_dim)
+            # Beta stays raw (bf16) here: the recurrent kernel sigmoids it in fp32
+            # at load (SIGMOID_BETA), and only the chunked prefill path needs the
+            # pre-computed fp32 sigmoid — computed lazily in _forward. Pure decode
+            # / spec-verify steps then skip the separate sigmoid and its fp32
+            # intermediate entirely.
+            beta = beta_raw.unsqueeze(0)
+            g1 = self.f_b_proj(f_a)[0]
+            g1 = g1.reshape(1, -1, self.local_num_heads, self.head_dim)
+
+            g_proj_states = self.g_b_proj(g_a)[0]
+            # Must stay 3D: rms_norm_gated reads H from g.shape[-2].
+            g2 = g_proj_states.reshape(-1, self.local_num_heads, self.head_dim)
 
         core_attn_out = torch.empty(
             (1, num_tokens, self.local_num_heads, self.head_dim),

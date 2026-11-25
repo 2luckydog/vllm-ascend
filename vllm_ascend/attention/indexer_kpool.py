@@ -23,6 +23,7 @@ from vllm.v1.attention.backend import (
 )
 from vllm.v1.kv_cache_interface import MLAAttentionSpec
 
+from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.core.kv_cache_interface import (
     AscendIndexerKPoolTailSpec,
     get_kv_cache_compression_ratio,
@@ -516,10 +517,12 @@ class Glm5NextKPoolIndexerBackend(nn.Module):
         self.tail_cache: Any = vllm_indexer.tail_cache
         self.topk_indices_buffer: torch.Tensor | None = vllm_indexer.topk_indices_buffer
         self._init_cann_ops()
+        self.tail_kg_cat = get_ascend_config().enable_indexer_tail_kg_cat
         for name in (
             "_key_weight",
             "_gate_weight",
             "_head_weight_f32",
+            "_kg_weight",
             "_norm_weight_f32",
             "_norm_bias_f32",
         ):
@@ -542,6 +545,11 @@ class Glm5NextKPoolIndexerBackend(nn.Module):
         self._key_weight = self.wk_weights_proj.weight[: self.head_dim].detach().contiguous()
         self._gate_weight = self.index_kpool_compress_gate.detach().to(self._key_weight.dtype).contiguous()
         self._head_weight_f32 = self.wk_weights_proj.weight[self.head_dim :].detach().float().contiguous()
+        if self.tail_kg_cat:
+            # key and gate share their input, so stacking the two [128, 4096]
+            # weights along N yields one [256, 4096] GEMM with zero input
+            # reshuffling.
+            self._kg_weight = torch.cat([self._key_weight, self._gate_weight], dim=0).contiguous()
         self._norm_weight_f32 = self.k_norm.weight.detach().float() if self.k_norm.weight is not None else None
         self._norm_bias_f32 = self.k_norm.bias.detach().float() if self.k_norm.bias is not None else None
 
@@ -716,12 +724,31 @@ class Glm5NextKPoolIndexerBackend(nn.Module):
         if tail_metadata.cann_inputs.retained_indices is not None:
             # Re-project the live MTP rollback window missing from CANN state.
             tail_hidden = self._gather_retained_hidden(hidden_states, tail_metadata.cann_inputs.retained_indices)
-            tail_key = F.linear(tail_hidden, self._key_weight).float()
-            if self._norm_weight_f32 is not None:
-                tail_key = F.layer_norm(
-                    tail_key, (self.head_dim,), self._norm_weight_f32, self._norm_bias_f32, norm_eps
-                )
-            tail_gate = F.linear(tail_hidden, self._gate_weight).float()
+            if self._kg_weight is not None:
+                # One N-concatenated GEMM instead of two launches. The writeback
+                # kernel consumes it through its key/gate stride arguments: when
+                # no norm is configured both halves come from this buffer, and
+                # with a norm the key is a contiguous slice while the gate stays
+                # a strided view into the tail of the same buffer.
+                fused = F.linear(tail_hidden, self._kg_weight).float()
+                if self._norm_weight_f32 is not None:
+                    tail_key = F.layer_norm(
+                        fused[:, : self.head_dim].contiguous(),
+                        (self.head_dim,),
+                        self._norm_weight_f32,
+                        self._norm_bias_f32,
+                        norm_eps,
+                    )
+                    tail_gate = fused[:, self.head_dim :]
+                else:
+                    tail_key = tail_gate = fused
+            else:
+                tail_key = F.linear(tail_hidden, self._key_weight).float()
+                if self._norm_weight_f32 is not None:
+                    tail_key = F.layer_norm(
+                        tail_key, (self.head_dim,), self._norm_weight_f32, self._norm_bias_f32, norm_eps
+                    )
+                tail_gate = F.linear(tail_hidden, self._gate_weight).float()
         self._write_keypool_caches(
             tail_cache,
             indexer_cache,

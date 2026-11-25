@@ -7,7 +7,17 @@ from types import SimpleNamespace
 from vllm.triton_utils import tl, triton
 
 
-@triton.jit(do_not_specialize=["tail_rows", "tail_blocks", "cache_blocks", "INPUT_STRIDE", "INPUT_WIDTH"])
+@triton.jit(
+    do_not_specialize=[
+        "tail_rows",
+        "tail_blocks",
+        "cache_blocks",
+        "INPUT_STRIDE",
+        "INPUT_WIDTH",
+        "KEY_STRIDE",
+        "GATE_STRIDE",
+    ]
+)
 def _write_keypool_caches_kernel(
     tail,
     cache,
@@ -31,6 +41,12 @@ def _write_keypool_caches_kernel(
     INPUT_WIDTH,
     SPECULATIVE: tl.constexpr,
     BLOCK: tl.constexpr,
+    # Row strides of the key / gate buffers. The original path passes
+    # contiguous [N, HEAD_DIM] tensors (stride == HEAD_DIM); the fused tail
+    # variant passes either one [N, 2*HEAD_DIM] buffer for both (stride ==
+    # 2*HEAD_DIM) or a contiguous layer-normed key plus a strided gate view.
+    KEY_STRIDE,
+    GATE_STRIDE,
 ):
     row = tl.program_id(0)
     cols = tl.arange(0, BLOCK)
@@ -39,9 +55,9 @@ def _write_keypool_caches_kernel(
         dest = tl.load(writes + input_row).to(tl.int64)
         valid = (dest >= 0) & (dest // PAGE_ROWS < tail_blocks) & (dest % PAGE_ROWS < CAPACITY)
         if SPECULATIVE:
-            k = tl.load(key + row * HEAD_DIM + cols, valid & (cols < HEAD_DIM), other=0)
+            k = tl.load(key + row * KEY_STRIDE + cols, valid & (cols < HEAD_DIM), other=0)
             g = tl.load(
-                gate + row * HEAD_DIM + cols - HEAD_DIM, valid & (cols >= HEAD_DIM) & (cols < 2 * HEAD_DIM), other=0
+                gate + row * GATE_STRIDE + cols - HEAD_DIM, valid & (cols >= HEAD_DIM) & (cols < 2 * HEAD_DIM), other=0
             )
             tail_value = tl.where(cols < HEAD_DIM, k, g)
         else:
@@ -86,6 +102,8 @@ def write_keypool_caches(tail, cache, key, gate, pooled, metadata, tail_metadata
         writes.shape[1],
         key is not None,
         triton.next_power_of_2(2 * cache.shape[-1]),
+        key.stride(0) if key is not None else cache.shape[-1],
+        gate.stride(0) if gate is not None else cache.shape[-1],
     )
 
 

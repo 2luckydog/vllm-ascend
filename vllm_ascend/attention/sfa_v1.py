@@ -73,6 +73,7 @@ from vllm_ascend.utils import (
     is_mtp_layer,
     is_rl_weight_update_enabled,
     maybe_trans_nz,
+    npu_stream_switch,
     oproj_tp_enable,
 )
 
@@ -93,6 +94,19 @@ SMLA_DEFAULT_SINK_VALUE = 1.0
 # (key_quant_mode=value_quant_mode=3, 386-byte KV slot), not a separate operator.
 TQ_QUANT_MODE = 3
 TQ_TILE_SIZE = 128
+
+# Aux stream for the SFA KV/q split. One stream is shared by all layers: it is
+# only live inside a single layer's forward at a time, and the main stream
+# waits on it before any cache consumer runs. Lazily created because streams
+# must not be constructed at import time.
+_SFA_OVERLAP_STREAM = None
+
+
+def _sfa_overlap_stream() -> torch.npu.Stream:
+    global _SFA_OVERLAP_STREAM
+    if _SFA_OVERLAP_STREAM is None:
+        _SFA_OVERLAP_STREAM = torch_npu.npu.Stream()
+    return _SFA_OVERLAP_STREAM
 
 
 def generate_smla_plan(metadata, num_heads, head_dim, topk, cu_seqlens_q, topk_length):
@@ -882,6 +896,7 @@ class AscendSFAImpl(MLAAttentionImpl):
         # applies only to layers that own an indexer cache.
         self.enable_sparse_sfa_turboquant = ascend_config.enable_sparse_sfa_turboquant
         self.enable_sparse_sfa_c8 = ascend_config.enable_sparse_sfa_c8
+        self.sfa_kv_q_multistream = ascend_config.enable_sfa_kv_q_multistream
         if self.enable_sparse_sfa_c8:
             self.c8_cache_dtype = kv_cache_dtype_str_to_dtype(
                 self.vllm_config.cache_config.cache_dtype, self.vllm_config.model_config
@@ -2056,49 +2071,109 @@ class AscendSFAImpl(MLAAttentionImpl):
                 # Wait before the first main or indexer cache access.
                 self.layerwise_kv_cache_hook.wait_for_layer(layer_name)
 
-            kv_outputs = self.exec_kv(
-                kv_no_split,
-                cos,
-                sin,
-                kv_cache,
-                parallel_context.kv_slot_mapping,
-                attn_metadata,
-            )
-            k_pe, k_nope = kv_outputs[:2]
-            knope_scale = kv_outputs[2] if len(kv_outputs) == 3 else None
-            # k_li no longer exists at this point: it is computed by
-            # indexer.forward_k below and gathered at cache-write time, so
-            # the fused gather below only carries the main KV.
-            fused_kv_no_split, kv_ag_handles = self._prepare_kv_for_parallel(
-                k_pe,
-                k_nope,
-                knope_scale,
-                parallel_context.gather_full_o_proj,
-            )
+            if self.sfa_kv_q_multistream:
+                # Decode steady state: the KV chain (exec_kv's rmsnorm + block
+                # quant, then cat + scatter) is pure Vector work, while the q
+                # chain (q_b_proj and the absorbed-q matmul) is pure Cube work.
+                # They only share qkv_lora upstream, so moving the KV chain to
+                # an aux stream lets it hide under the Cube pipeline instead of
+                # sitting in front of it. The connector waits above stay on the
+                # main thread: they block the host, so relocating them would not
+                # overlap any device work.
+                _main_stream = torch.npu.current_stream()
+                _aux_stream = _sfa_overlap_stream()
+                _fork_event = _main_stream.record_event()
 
-            ql_nope, q_pe = self._q_proj_and_k_up_proj(q_c)
-            if self.qk_rope_head_dim:
-                q_pe = self.rope_single(q_pe, cos, sin)
-            self._record_query_gather_context(
-                ql_nope,
-                q_pe,
-                attn_metadata,
-            )
+                with npu_stream_switch(_aux_stream, enabled=True):
+                    torch.npu.current_stream().wait_event(_fork_event)
+                    kv_outputs = self.exec_kv(
+                        kv_no_split,
+                        cos,
+                        sin,
+                        kv_cache,
+                        parallel_context.kv_slot_mapping,
+                        attn_metadata,
+                    )
+                    k_pe, k_nope = kv_outputs[:2]
+                    knope_scale = kv_outputs[2] if len(kv_outputs) == 3 else None
+                    fused_kv_no_split, kv_ag_handles = self._prepare_kv_for_parallel(
+                        k_pe,
+                        k_nope,
+                        knope_scale,
+                        parallel_context.gather_full_o_proj,
+                    )
+                    (
+                        k_pe,
+                        k_nope,
+                    ) = self._store_parallel_kv(
+                        k_pe,
+                        k_nope,
+                        knope_scale,
+                        fused_kv_no_split,
+                        kv_ag_handles,
+                        kv_cache,
+                        self._get_sfa_kv_slot_mapping(attn_metadata),
+                        attn_metadata,
+                        parallel_context.gather_full_o_proj,
+                    )
+                    _kv_done_event = torch.npu.current_stream().record_event()
 
-            (
-                k_pe,
-                k_nope,
-            ) = self._store_parallel_kv(
-                k_pe,
-                k_nope,
-                knope_scale,
-                fused_kv_no_split,
-                kv_ag_handles,
-                kv_cache,
-                self._get_sfa_kv_slot_mapping(attn_metadata),
-                attn_metadata,
-                parallel_context.gather_full_o_proj,
-            )
+                ql_nope, q_pe = self._q_proj_and_k_up_proj(q_c)
+                if self.qk_rope_head_dim:
+                    q_pe = self.rope_single(q_pe, cos, sin)
+                self._record_query_gather_context(
+                    ql_nope,
+                    q_pe,
+                    attn_metadata,
+                )
+
+                # The indexer k path and every attention kernel below read the
+                # KV that was scattered on the aux stream.
+                _main_stream.wait_event(_kv_done_event)
+            else:
+                kv_outputs = self.exec_kv(
+                    kv_no_split,
+                    cos,
+                    sin,
+                    kv_cache,
+                    parallel_context.kv_slot_mapping,
+                    attn_metadata,
+                )
+                k_pe, k_nope = kv_outputs[:2]
+                knope_scale = kv_outputs[2] if len(kv_outputs) == 3 else None
+                # k_li no longer exists at this point: it is computed by
+                # indexer.forward_k below and gathered at cache-write time, so
+                # the fused gather below only carries the main KV.
+                fused_kv_no_split, kv_ag_handles = self._prepare_kv_for_parallel(
+                    k_pe,
+                    k_nope,
+                    knope_scale,
+                    parallel_context.gather_full_o_proj,
+                )
+
+                ql_nope, q_pe = self._q_proj_and_k_up_proj(q_c)
+                if self.qk_rope_head_dim:
+                    q_pe = self.rope_single(q_pe, cos, sin)
+                self._record_query_gather_context(
+                    ql_nope,
+                    q_pe,
+                    attn_metadata,
+                )
+
+                (
+                    k_pe,
+                    k_nope,
+                ) = self._store_parallel_kv(
+                    k_pe,
+                    k_nope,
+                    knope_scale,
+                    fused_kv_no_split,
+                    kv_ag_handles,
+                    kv_cache,
+                    self._get_sfa_kv_slot_mapping(attn_metadata),
+                    attn_metadata,
+                    parallel_context.gather_full_o_proj,
+                )
 
         # A sharded-decode PCP rank can own no request but must still write
         # and gather KV with the other ranks.

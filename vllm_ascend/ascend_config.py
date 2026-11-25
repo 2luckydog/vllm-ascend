@@ -443,6 +443,9 @@ class AscendConfig:
             "msmonitor_use_daemon": false,
             "enable_transpose_kv_cache_by_block": true,
             "weight_nz_mode": 1,
+            "enable_sfa_kv_q_multistream": false,
+            "enable_kda_fg_bmm_merge": false,
+            "enable_indexer_tail_kg_cat": false,
             "enable_shared_expert_dp": false,
             "enable_sparse_sfa_c8": false,
             "enable_sparse_li_c8": false,
@@ -613,6 +616,30 @@ class AscendConfig:
     msmonitor_use_daemon: bool = False
     enable_transpose_kv_cache_by_block: bool = True
     weight_nz_mode: int = 1
+    # Decode steady state: run the SFA KV chain (kv norm -> block quant ->
+    # cat -> scatter, all Vector work) on an auxiliary stream while the q
+    # chain (q_b_proj + absorbed q, all Cube work) runs on the main stream.
+    # The KV chain is ~30us/layer of pure Vector work that currently sits
+    # back-to-back in front of the Cube work. Only the NATIVE preprocessing
+    # path is touched (GLM5.3-Flash is NoPE, so the fused prolog paths are
+    # never selected). Default False keeps the original single-stream order.
+    enable_sfa_kv_q_multistream: bool = False
+    # Run the two low-rank f_a/g_a projections ([T,128]x[2048,128] each) as a
+    # single batched matmul (bmm, batch=2) and collapse the two per-branch
+    # slices into one contiguous slice. f_a/g_a are adjacent shards of the
+    # fused in_proj output, so a single slice + view feeds both branches.
+    # Decode/MTP keeps T fixed at 1+num_speculative_tokens, so the batched
+    # shape is graph-capturable. Falls back to the original two-linear path
+    # when the branch weights are quantized or not a plain bf16/fp16 matmul.
+    enable_kda_fg_bmm_merge: bool = False
+    # Merge the two DSA indexer tail projections (key / gate, both
+    # [N,4096]x[128,4096]) into one [N,4096]x[256,4096] GEMM. They share the
+    # same gathered hidden input, so concatenating the weights along N needs
+    # no input reshuffle at all (this is why it beats the bmm form used for
+    # f_a/g_a, which had to pay an AsStrided kernel). The tail writeback
+    # triton kernel gains key/gate row-stride arguments so it can consume the
+    # fused [N,256] buffer, or a layer-normed key plus a strided gate view.
+    enable_indexer_tail_kg_cat: bool = False
 
     # ---- sub-configs (no vllm_config dep): pydantic dict→dataclass coercion ----
     ascend_compilation_config: AscendCompilationConfig = dataclasses.field(default_factory=AscendCompilationConfig)
